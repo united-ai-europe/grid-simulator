@@ -109,13 +109,26 @@ const BASE = {
      Math.abs(r.pnl_pct.p50) < 1e-12);
 }
 
-/* ---------- 6. plafon 10.000 si nivelurile grilei ---------- */
+/* ---------- 6. plafonul de traiectorii si nivelurile grilei ---------- */
 {
   const rr = []; const rng = E.xoshiro128ss(9, 0);
   for (let i = 0; i < 400; i++) rr.push(0.02 * rng.normal());
   const coin = coinFrom(rr, 100);
-  const r = E.runCombination({ ...BASE, coin, model: 'B', conservative: false, paths: 999999, days: 1 });
-  ok('plafon 10.000 impus in motor', r.paths === 10000, 'paths = ' + r.paths);
+  /* 0.2.0: peste plafon se ARUNCA, nu se trunchiaza. Pana aici o cerere de 999.999 intorcea
+     `paths: 10000` fara niciun semnal, deci un raport putea declara o precizie inexistenta. */
+  let threw = null;
+  try {
+    E.runCombination({ ...BASE, coin, model: 'B', conservative: false, paths: 999999, days: 1 });
+  } catch (e) { threw = e.message; }
+  ok('peste plafon se arunca, nu se trunchiaza in silenţiu',
+     threw !== null && /exceeds MAX_PATHS/.test(threw), String(threw));
+  ok('mesajul spune si cat s-a cerut si cat e plafonul',
+     threw !== null && threw.includes('999999') && threw.includes(String(E.MAX_PATHS)), String(threw));
+  ok('plafonul e 20.000 in 0.2.0', E.MAX_PATHS === 20000, String(E.MAX_PATHS));
+  const rOk = E.runCombination({ ...BASE, coin, model: 'B', conservative: false, paths: 300, days: 1 });
+  ok('rezultatul declara si cat s-a cerut, nu doar cat s-a rulat',
+     rOk.paths === 300 && rOk.paths_requested === 300,
+     rOk.paths + '/' + rOk.paths_requested);
   const L = E.buildLevels(80, 120, 5);
   ok('nivelurile acopera exact intervalul', L[0] === 80 && L[4] === 120);
   ok('nivelurile sunt strict crescatoare', L.every((v, i) => i === 0 || v > L[i - 1]));
@@ -364,6 +377,253 @@ const BASE = {
   ok('verdictul pe o rulare reala e una dintre cele trei etichete',
      ['ROBUST', 'NEGATIVE EXPECTATION', 'MIXED'].includes(rb.label), rb.label);
   ok('verdictul isi declara motivul', typeof rb.reason === 'string' && rb.reason.length > 20, rb.reason);
+}
+
+/* ---------- crash replay: drum impus (0.2.0) ---------- */
+{
+  const rng = E.xoshiro128ss(77, 0); const rr = [];
+  for (let i = 0; i < 500; i++) rr.push(0.03 * rng.normal());
+  const coin = coinFrom(rr, 1000, 4);
+  /* Un episod artificial dar fara echivoc: 20 de zile, din care o cadere mare. */
+  const seq = []; for (let i = 0; i < 20; i++) seq.push(i === 10 ? -0.25 : -0.01);
+  const EP = { returns: seq, label: 'TEST 2026-01-15..2026-02-03', source: 'S1', ref_close: 1000 };
+  const RP = { ...BASE, coin, path: EP, paths: 400, conservative: false };
+
+  const r = E.runCombination(RP);
+  ok('replay: orizontul e lungimea episodului, nu `days` din opts',
+     r.days === seq.length, r.days + ' vs ' + seq.length);
+  ok('replay: orizontul NU se lasa suprascris de `days`',
+     E.runCombination({ ...RP, days: 999 }).days === seq.length);
+  ok('replay: modelul se eticheteaza REPLAY, nu A/B/C', r.model === 'REPLAY', r.model);
+  ok('replay: rezultatul poarta eticheta si sursa drumului',
+     r.path_label === EP.label && r.path_source === 'S1', r.path_label + ' / ' + r.path_source);
+  ok('replay: o simulare obisnuita NU poarta path_label (altfel garda ar bloca totul)',
+     E.runCombination({ ...BASE, coin, model: 'B', paths: 50, days: 5 }).path_label === undefined);
+
+  /* Preţul de referinţa: inchiderea zilei de START a episodului, nu preţul de azi. */
+  ok('replay: preţul de referinţa e ref_close, nu coin.reference_price',
+     r.reference_price === 1000 && coin.reference_price === 1000);
+  /* ATENTIE la ce poate si ce nu poate dovedi un test aici. Sistemul e INVARIANT LA SCARA:
+     nivelurile sunt refPrice*(1+pct), cantitatea e (capital/2)/refPrice/above, iar drumul e
+     relativ — deci PnL-ul IN PROCENTE nu se schimba daca preţul de referinţa se scaleaza.
+     Prima versiune a acestui test cerea ca un `ref_close` diferit sa schimbe PnL-ul; a picat, si
+     corect. Ce conteaza cu adevarat e ca `ref_close` ajunge preţul de referinţa RAPORTAT, fiindca
+     de el atarna preţurile ABSOLUTE pe care UI-ul le afiseaza: marginile grilei din episod trebuie
+     sa fie preţurile reale de atunci, nu cele de azi. */
+  const r2 = E.runCombination({ ...RP, path: { ...EP, ref_close: 250 } });
+  ok('replay: ref_close devine preţul de referinţa raportat',
+     r2.reference_price === 250, String(r2.reference_price));
+  ok('replay: PnL-ul in procente e invariant la scara (deci NU poate dovedi singur ref_close)',
+     Math.abs(r2.pnl_pct.p50 - r.pnl_pct.p50) < 1e-9,
+     r2.pnl_pct.p50.toFixed(9) + ' vs ' + r.pnl_pct.p50.toFixed(9));
+  ok('replay: preţul de referinţa nu e luat din moneda cand episodul il da',
+     E.runCombination({ ...RP, coin: { ...coin, reference_price: 7777 },
+                        path: { ...EP, ref_close: 250 } }).reference_price === 250);
+  ok('replay fara ref_close cade pe preţul monedei',
+     E.runCombination({ ...RP, path: { returns: seq, label: 'x' } }).reference_price === 1000);
+
+  /* path si model sunt exclusive: altfel un rezultat ar purta o eticheta falsa. */
+  let threwBoth = null;
+  try { E.runCombination({ ...RP, model: 'B' }); } catch (e) { threwBoth = e.message; }
+  ok('replay: `path` si `model` simultan sunt refuzate',
+     threwBoth !== null && /mutually exclusive/.test(threwBoth), String(threwBoth));
+
+  let threwNaN = null;
+  try { E.runCombination({ ...RP, path: { ...EP, returns: [0.01, NaN, 0.02] } }); }
+  catch (e) { threwNaN = e.message; }
+  ok('replay: o valoare nefinita e refuzata, nu propagata ca NaN',
+     threwNaN !== null && /not finite/.test(threwNaN), String(threwNaN));
+
+  let threwEmpty = null;
+  try { E.runCombination({ ...RP, path: { ...EP, returns: [] } }); }
+  catch (e) { threwEmpty = e.message; }
+  ok('replay: un episod gol e refuzat', threwEmpty !== null && /empty/.test(threwEmpty), String(threwEmpty));
+
+  /* Ziua e fixa: singura aleatorietate e puntea intrazi, deci dispersia intre traiectorii e mult
+     mai mica decat la o simulare. Asta e proprietatea care face verdictul inaplicabil. */
+  const sim = E.runCombination({ ...BASE, coin, model: 'B', conservative: false, paths: 400, days: seq.length });
+  ok('replay: dispersia intre traiectorii e mult mai mica decat la o simulare',
+     r.pnl_pct.se_mean < sim.pnl_pct.se_mean / 5,
+     'replay se ' + r.pnl_pct.se_mean.toFixed(4) + ' vs simulare ' + sim.pnl_pct.se_mean.toFixed(4));
+
+  /* GARDA: verdictul nu are voie sa fie calculat pe un replay. */
+  const six = [];
+  for (let i = 0; i < 3; i++) for (const cons of [false, true])
+    six.push(E.runCombination({ ...RP, conservative: cons }));
+  let threwRb = null;
+  try { E.robustness(six); } catch (e) { threwRb = e.message; }
+  ok('robustness() REFUZA rezultate de replay',
+     threwRb !== null && /does not apply to replay/.test(threwRb), String(threwRb));
+  ok('mesajul numeste episodul, ca sa se vada care rezultat a declansat refuzul',
+     threwRb !== null && threwRb.includes(EP.label), String(threwRb));
+  ok('robustness() functioneaza in continuare pe rezultate de simulare',
+     typeof E.robustness([sim, sim, sim, sim, sim, sim]).label === 'string');
+
+  /* Un replay se poate si partitiona, ca orice combinatie. */
+  const pa = E.simulatePaths({ ...RP, paths: 150, path_offset: 0, raw: true });
+  const pb = E.simulatePaths({ ...RP, paths: 250, path_offset: 150, raw: true });
+  ok('replay: partitionarea da acelasi rezultat bit cu bit',
+     JSON.stringify(E.combineRaw([pb, pa])) === JSON.stringify(r));
+}
+
+/* ---------- bugetul de timp: fiecare ramura, cu c injectat (0.2.0) ---------- */
+{
+  /* `c` e costul PISCINEI: ms de ceas de perete pe traiectorie-zi-combinatie cu toţi lucratorii
+     la treaba. Masurat pe o staţie de lucru desktop in Chrome, cu piscina plina: ~0,0053 ms
+     (echivalentul a ~0,0437 ms pe un singur fir, dar impartirea la numarul de nuclee NU e valida —
+     de aceea se masoara direct debitul piscinei). Dispozitivele mai lente se reprezinta ca
+     multipli, deci testele nu cer nicio cronometrare.
+     C de mai jos e o valoare de REFERINTA rotunda, aleasa ca aritmetica sa fie verificabila de
+     mana, nu o masuratoare: valorile masurate efectiv in browser sunt raportate de
+     ~/site-audit/e2e/run_e2e.mjs, care executa chiar pagina. */
+  const C = 0.0040;
+  const plan = (o) => E.planPaths({ c: C * (o.slow || 1), days: o.days, workers: o.workers || 1,
+                                    coarse: !!o.coarse, requested: o.requested === undefined ? null : o.requested,
+                                    combinations: 6 });
+
+  ok('pragurile sunt constante numite, nu numere in cod',
+     E.BUDGET_TARGET_S === 8 && E.PATHS_MIN === 1000 && E.RUN_FREE_S === 30 &&
+     E.RUN_CONFIRM_S === 90 && E.COARSE_HARD_CAP_S === 30,
+     [E.BUDGET_TARGET_S, E.PATHS_MIN, E.RUN_FREE_S, E.RUN_CONFIRM_S, E.COARSE_HARD_CAP_S].join('/'));
+  ok('alegerile oferite sunt 10.000/5.000/2.000',
+     E.PATH_CHOICES.join(',') === '10000,5000,2000', E.PATH_CHOICES.join(','));
+
+  /* RAPID: 10.000 incap in ţinta. */
+  const fast = plan({ days: 30, slow: 1 });            /* 10.000 -> 7,2 s */
+  ok('dispozitiv rapid: se alege cel mai mare numar care incape in ţinta',
+     fast.paths === 10000 && fast.seconds <= E.BUDGET_TARGET_S && fast.action === 'run',
+     fast.paths + ' / ' + fast.seconds.toFixed(1) + ' s');
+
+  /* MEDIU: 10.000 nu incap, 5.000 da. */
+  const mid = plan({ days: 30, slow: 1.5 });           /* 10.000 -> 10,8 s; 5.000 -> 5,4 s */
+  ok('dispozitiv mediu: coboara la urmatoarea alegere, nu la minim',
+     mid.paths === 5000 && mid.seconds <= E.BUDGET_TARGET_S,
+     mid.paths + ' / ' + mid.seconds.toFixed(1) + ' s');
+  ok('alegerea implicita isi declara motivul',
+     /largest of/.test(mid.chosen_because), mid.chosen_because);
+
+  /* LENT: nici 2.000 nu incap -> podeaua, dar inca sub pragul de rulare libera. */
+  const slow = plan({ days: 30, slow: 10 });           /* 2.000 -> 14,4 s; 1.000 -> 7,2 s */
+  ok('dispozitiv lent: cade pe podeaua de 1.000, nu sub ea',
+     slow.paths === E.PATHS_MIN && slow.action === 'run' && slow.warn === null,
+     slow.paths + ' / ' + slow.seconds.toFixed(1) + ' s / ' + slow.action);
+  ok('podeaua isi declara motivul', /floor of 1000/.test(slow.chosen_because), slow.chosen_because);
+
+  /* FOARTE LENT: chiar si podeaua depaseste pragul -> ruleaza, cu avertisment, niciodata refuz. */
+  const verySlow = plan({ days: 90, slow: 60 });       /* 1.000 -> 130 s */
+  ok('chiar si podeaua peste prag: ruleaza cu avertisment, nu refuza',
+     verySlow.paths === E.PATHS_MIN && verySlow.action === 'run' && verySlow.warn === 'slow-device',
+     verySlow.action + ' / ' + verySlow.warn + ' / ' + verySlow.seconds.toFixed(0) + ' s');
+
+  /* BANDA DE CONFIRMARE: o cerere explicita intre 30 si 90 de secunde. */
+  const confirm = plan({ days: 90, slow: 2, requested: 10000 });     /* 43,2 s */
+  ok('intre 30 si 90 s se cere confirmare, cu timpul in motiv',
+     confirm.action === 'confirm' && confirm.seconds > E.RUN_FREE_S &&
+     confirm.seconds <= E.RUN_CONFIRM_S && /estimated/.test(confirm.reason),
+     confirm.seconds.toFixed(0) + ' s / ' + confirm.reason);
+
+  /* REFUZ: peste 90 de secunde. */
+  const refuse = plan({ days: 90, slow: 4, requested: 20000 });      /* 173 s */
+  ok('peste 90 s se refuza', refuse.action === 'refuse' && /above the 90 s limit/.test(refuse.reason),
+     refuse.seconds.toFixed(0) + ' s / ' + refuse.reason);
+
+  /* TACTIL: plafon dur la 30 s, fara banda de confirmare. */
+  const touchOk = plan({ days: 30, slow: 10, coarse: true, requested: 2000 });   /* 14,4 s */
+  ok('tactil, sub plafon: ruleaza', touchOk.action === 'run', touchOk.seconds.toFixed(1) + ' s');
+  const touchNo = plan({ days: 90, slow: 5, coarse: true, requested: 5000 });    /* 54 s */
+  ok('tactil, peste 30 s: REFUZ, nu confirmare',
+     touchNo.action === 'refuse' && /touch devices/.test(touchNo.reason),
+     touchNo.seconds.toFixed(0) + ' s / ' + touchNo.action);
+  const sameNonTouch = plan({ days: 90, slow: 5, coarse: false, requested: 5000 });
+  ok('aceeasi configuratie pe ecran ne-tactil: confirmare, nu refuz',
+     sameNonTouch.action === 'confirm',
+     sameNonTouch.seconds.toFixed(0) + ' s / ' + sameNonTouch.action);
+  const touchFloor = plan({ days: 90, slow: 60, coarse: true });
+  ok('tactil, dar chiar si podeaua e peste plafon: ruleaza cu avertisment',
+     touchFloor.action === 'run' && touchFloor.warn === 'slow-device',
+     touchFloor.action + ' / ' + touchFloor.warn);
+
+  /* Peste plafonul motorului: refuz la planificare, nu eroare la rulare. */
+  const overCap = plan({ days: 1, requested: 50000 });
+  ok('peste MAX_PATHS se refuza la planificare',
+     overCap.action === 'refuse' && /engine limit/.test(overCap.reason), overCap.reason);
+
+  /* Estimarea e liniara in ce trebuie si scade cu lucratorii. */
+  const e1 = E.estimateSeconds(C, 30, 2000, 6);
+  ok('estimarea e liniara in zile', Math.abs(E.estimateSeconds(C, 90, 2000, 6) - 3 * e1) < 1e-9);
+  ok('estimarea e liniara in traiectorii', Math.abs(E.estimateSeconds(C, 30, 4000, 6) - 2 * e1) < 1e-9);
+  /* Numarul de lucratori NU mai intra in aritmetica: `c` e deja o masuratoare a piscinei intregi.
+     O impartire aici ar reintroduce subevaluarea de 1,5x gasita in browser. */
+  ok('numarul de lucratori nu mai intra in estimare',
+     E.estimateSeconds(C, 30, 2000, 6) === E.estimateSeconds(C, 30, 2000, 6, 8));
+  ok('estimarea la 2.000 de traiectorii e de ordinul unei secunde cu piscina plina',
+     e1 > 1 && e1 < 2, e1.toFixed(2) + ' s');
+}
+
+/* ---------- partitionare bit-identica intre 1 si N lucratori (0.2.0) ---------- */
+{
+  const rng = E.xoshiro128ss(5, 0); const rr = [];
+  for (let i = 0; i < 500; i++) rr.push(0.03 * rng.normal());
+  const coin = coinFrom(rr, 100, 4);
+  const CFG = { ...BASE, coin, model: 'C', conservative: true, days: 30, seed: 4242 };
+  const N = 1200;
+  const ref = JSON.stringify(E.runCombination({ ...CFG, paths: N }));
+
+  const bad = [];
+  for (const W of [1, 2, 3, 5, 7, 8]) {
+    /* Felii NEEGALE intentionat, si numere care nu divid N (3, 7), ca sa nu existe o
+       partitionare norocoasa. */
+    const per = Math.floor(N / W), parts = [];
+    let off = 0;
+    for (let w = 0; w < W; w++) {
+      const n = (w === W - 1) ? (N - off) : per;
+      parts.push(E.simulatePaths({ ...CFG, paths: n, path_offset: off, raw: true }));
+      off += n;
+    }
+    /* Ordinea de sosire INVERSATA: concatenarea nu are voie sa depinda de cine termina primul. */
+    const got = E.combineRaw(parts.slice().reverse());
+    if (JSON.stringify(got) !== ref) bad.push('W=' + W);
+  }
+  ok('rezultatul e identic bit cu bit intre 1 si N lucratori (W = 1,2,3,5,7,8)',
+     bad.length === 0, bad.join(',') || 'toate identice');
+
+  /* time_outside_range e SINGURUL camp calculat cu mean() fara sortare, deci singurul care ar
+     putea sa depinda de ordine. Merita numit separat. */
+  const p3 = [];
+  let off3 = 0;
+  for (const n of [401, 399, 400]) { p3.push(E.simulatePaths({ ...CFG, paths: n, path_offset: off3, raw: true })); off3 += n; }
+  const comb = E.combineRaw(p3.slice().reverse());
+  const whole = E.runCombination({ ...CFG, paths: N });
+  ok('time_outside_range e identic bit cu bit (singurul camp sensibil la ordine)',
+     comb.time_outside_range === whole.time_outside_range,
+     comb.time_outside_range + ' vs ' + whole.time_outside_range);
+  ok('si p_neg si cvar5 sunt identice bit cu bit dupa partitionare',
+     comb.pnl_pct.p_neg === whole.pnl_pct.p_neg && comb.pnl_pct.cvar5 === whole.pnl_pct.cvar5);
+
+  /* Partitionari care nu acopera exact intervalul trebuie sa fie refuzate, nu sa dea un rezultat
+     plauzibil dar greşit. */
+  const gap = [E.simulatePaths({ ...CFG, paths: 100, path_offset: 0, raw: true }),
+               E.simulatePaths({ ...CFG, paths: 100, path_offset: 150, raw: true })];
+  let threwGap = null;
+  try { E.combineRaw(gap); } catch (e) { threwGap = e.message; }
+  ok('o gaura intre felii e refuzata', threwGap !== null && /do not tile/.test(threwGap), String(threwGap));
+
+  const dup = [E.simulatePaths({ ...CFG, paths: 100, path_offset: 0, raw: true }),
+               E.simulatePaths({ ...CFG, paths: 100, path_offset: 0, raw: true })];
+  let threwDup = null;
+  try { E.combineRaw(dup); } catch (e) { threwDup = e.message; }
+  ok('o suprapunere de felii e refuzata', threwDup !== null && /do not tile/.test(threwDup), String(threwDup));
+
+  const mixed = [E.simulatePaths({ ...CFG, paths: 100, path_offset: 0, raw: true }),
+                 E.simulatePaths({ ...CFG, model: 'B', paths: 100, path_offset: 100, raw: true })];
+  let threwMix = null;
+  try { E.combineRaw(mixed); } catch (e) { threwMix = e.message; }
+  ok('felii produse cu modele diferite sunt refuzate',
+     threwMix !== null && /disagree on how/.test(threwMix), String(threwMix));
+
+  ok('path_offset alege CARE traiectorii, nu doar cate',
+     JSON.stringify(E.simulatePaths({ ...CFG, paths: 50, path_offset: 0, raw: true }).pnl) !==
+     JSON.stringify(E.simulatePaths({ ...CFG, paths: 50, path_offset: 50, raw: true }).pnl));
 }
 
 /* ---------- eroarea Monte Carlo e raportata ---------- */

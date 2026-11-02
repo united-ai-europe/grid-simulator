@@ -418,7 +418,10 @@ function runPath(cfg, rng, dailyBuf) {
 
 /* ------------------------------------------------------------------ public API */
 
-const MAX_PATHS = 10000;
+/* 0.2.0: ridicat de la 10.000. Peste plafon NU se mai trunchiaza in silenţiu — vezi
+   `paths_requested` si eroarea din simulatePaths. Pana la 0.2.0, o cerere de 20.000 intorcea
+   `paths: 10000` fara niciun semnal, deci un raport putea declara o precizie pe care nu o avea. */
+const MAX_PATHS = 20000;
 const BLOCK_DAYS = 5;
 
 /* Intraday resolution. Fixed, not adapted to the device.
@@ -451,10 +454,178 @@ function empiricalSd(returns) {
   return Math.sqrt(v / Math.max(1, returns.length - 1));
 }
 
-function runCombination(opts) {
+/* ------------------------------------------------- bugetul de timp al unei rulari
+ *
+ * Costul e LINIAR in zile si in traiectorii, masurat: 1,307 ms pe traiectorie-combinatie la 30 de
+ * zile si 3,936 la 90 (raport 2,97 pentru un orizont de 3,0), si plat intre 1.000 si 10.000 de
+ * traiectorii. Deci costul total e `c · zile · traiectorii · combinatii`, cu o singura constanta
+ * `c` de masurat. Pe aceasta masina c ≈ 0,0437 ms; pe dispozitivul vizitatorului se MASOARA la
+ * fiecare incarcare a paginii, printr-o rulare scurta de calibrare, si nu se memoreaza nicaieri —
+ * nici in localStorage, nici in sessionStorage — ca promisiunea "nu stocam nimic despre vizitator"
+ * de pe /verify/ sa rămână literal adevarata.
+ *
+ * Pragurile sunt pe TIMP, nu pe tipul dispozitivului: un telefon nou poate fi mai rapid decat un
+ * laptop vechi, iar o detectie pe user agent ar imbatrani. Singura regula legata de dispozitiv e
+ * plafonul dur pe ecran tactil, unde o pagina care nu raspunde 40 de secunde e indistingabila de
+ * una blocata si nu exista o fila de abandonat fara sa pierzi pagina.
+ *
+ * Toate pragurile stau aici, ca numere numite, si fiecare are motivul lui. `planPaths` e o functie
+ * pura: de aceea fiecare ramura are test cu `c` injectat (rapid, mediu, lent, tactil), fara sa fie
+ * nevoie de cronometrari manuale.
+ */
+
+/* Ţinta implicita. 8 s e cat durează o rulare pe care un vizitator o asteapta fara sa creada ca
+   pagina s-a blocat, masurat impotriva implicitului de azi (2.000 de traiectorii, 30 de zile,
+   ~2,6 s pe aceasta masina cu piscina actuala). */
+const BUDGET_TARGET_S = 8;
+/* Alegerile oferite, de la cea mai precisa in jos. Nu un continuum: un numar rotund e verificabil
+   de cititor, iar `se ∝ 1/√N` face ca pasii intermediari sa nu schimbe mai nimic. */
+const PATH_CHOICES = [10000, 5000, 2000];
+/* Sub 1.000 de traiectorii eroarea Monte Carlo pe medie trece de 0,20 puncte procentuale
+   (masurat: 0,2043% la 1.000), adica ordinul de marime al rezultatului insusi. */
+const PATHS_MIN = 1000;
+/* Pana aici se ruleaza fara sa intrebam. */
+const RUN_FREE_S = 30;
+/* Intre RUN_FREE_S si aici se cere confirmare, cu timpul estimat afisat. Peste, se refuza: o
+   rulare de peste un minut si jumatate intr-o fila de browser e mai probabil o greseala de
+   parametri decat o intentie. */
+const RUN_CONFIRM_S = 90;
+/* Ecran tactil: plafon dur, fara banda de confirmare. */
+const COARSE_HARD_CAP_S = 30;
+
+/* `c` e costul PISCINEI, nu al unui fir: milisecunde de ceas de perete pe traiectorie-zi-combinatie
+   cand lucreaza toţi lucratorii. NU se mai imparte la numarul de lucratori.
+   DE CE (masurat in browser, 02.11.2026): impartirea la `navigator.hardwareConcurrency` da un
+   numar fictiv. Pe o masina cu nuclee de performanta SI de eficienţa, lucratorii nu merg toţi la
+   viteza celui mai rapid — primele estimari au ieşit 2,1 s pentru o rulare care a durat 3,2 s, o
+   subevaluare de 1,5x. Iar o estimare optimista e cel mai rau fel de estimare aici: toata politica
+   de pragure (8 s ţinta, 30 s liber, 90 s refuz) se sprijina pe ea. Acum se masoara exact
+   marimea folosita: se trimite acelasi lot tuturor lucratorilor simultan si se cronometreaza
+   ceasul de perete, deci `c` include deja paralelismul real, inclusiv cat se pierde din el. */
+function estimateSeconds(c, days, paths, combinations) {
+  return (c * days * paths * Math.max(1, combinations)) / 1000;
+}
+
+/* Intoarce ce se ruleaza si DE CE, ca UI-ul sa poata afisa motivul in loc sa pară arbitrar.
+     { paths, seconds, action: 'run'|'confirm'|'refuse', reason, warn, choices }
+   `requested` null inseamna "alege tu"; un numar inseamna ca vizitatorul a cerut explicit. */
+function planPaths(o) {
+  const c = o.c, days = o.days;
+  const combos = o.combinations === undefined ? 6 : o.combinations;
+  /* Doar informativ, pentru afisare: `c` include deja paralelismul. */
+  const workers = o.workers === undefined ? 1 : o.workers;
+  const coarse = !!o.coarse;
+  if (!(c > 0) || !(days >= 1)) throw new Error('planPaths: c and days must be positive');
+
+  const est = function (n) { return estimateSeconds(c, days, n, combos); };
+  const choices = PATH_CHOICES.map(function (n) {
+    return { paths: n, seconds: est(n), over_cap: est(n) > (coarse ? COARSE_HARD_CAP_S : RUN_CONFIRM_S) };
+  });
+
+  let paths, chosenReason;
+  if (o.requested === null || o.requested === undefined) {
+    paths = PATHS_MIN;
+    chosenReason = 'none of ' + PATH_CHOICES.join('/') + ' fits in ' + BUDGET_TARGET_S +
+                   ' s, so the floor of ' + PATHS_MIN + ' paths is used';
+    for (let i = 0; i < PATH_CHOICES.length; i++) {
+      if (est(PATH_CHOICES[i]) <= BUDGET_TARGET_S) {
+        paths = PATH_CHOICES[i];
+        chosenReason = 'largest of ' + PATH_CHOICES.join('/') + ' that fits in ' +
+                       BUDGET_TARGET_S + ' s on this device';
+        break;
+      }
+    }
+  } else {
+    paths = Math.max(1, o.requested | 0);
+    chosenReason = 'requested explicitly';
+  }
+
+  const seconds = est(paths);
+  let action, reason, warn = null;
+
+  if (paths > MAX_PATHS) {
+    action = 'refuse';
+    reason = paths + ' paths is above the engine limit of ' + MAX_PATHS;
+  } else if (seconds <= RUN_FREE_S) {
+    action = 'run';
+    reason = 'estimated ' + seconds.toFixed(1) + ' s, under the ' + RUN_FREE_S + ' s threshold';
+  } else if (paths <= PATHS_MIN) {
+    /* Chiar si minimul depaseste pragul: nu exista o configuratie mai mica de oferit, deci se
+       ruleaza si se spune ca dispozitivul e lent. Un refuz aici ar lasa vizitatorul fara nimic. */
+    action = 'run';
+    warn = 'slow-device';
+    reason = 'even the floor of ' + PATHS_MIN + ' paths needs ' + seconds.toFixed(0) +
+             ' s on this device';
+  } else if (coarse) {
+    action = 'refuse';
+    reason = 'estimated ' + seconds.toFixed(0) + ' s, above the ' + COARSE_HARD_CAP_S +
+             ' s cap for touch devices';
+  } else if (seconds <= RUN_CONFIRM_S) {
+    action = 'confirm';
+    reason = 'estimated ' + seconds.toFixed(0) + ' s, above ' + RUN_FREE_S + ' s';
+  } else {
+    action = 'refuse';
+    reason = 'estimated ' + seconds.toFixed(0) + ' s, above the ' + RUN_CONFIRM_S + ' s limit';
+  }
+
+  return { paths: paths, seconds: seconds, action: action, reason: reason,
+           chosen_because: chosenReason, warn: warn, choices: choices,
+           c: c, days: days, combinations: combos, workers: workers };
+}
+
+/* ------------------------------------------------- simulare si agregare, separate
+ *
+ * DE CE SUNT DOUA FUNCTII (0.2.0). O combinatie trebuie sa poata fi imparţita pe mai mulţi
+ * lucratori si sa dea un rezultat IDENTIC BIT CU BIT, oricate ar fi. Asta nu se obţine combinand
+ * statistici parţiale: `time_outside_range` se calculeaza cu mean(), care insumeaza in ordinea
+ * indicilor, iar adunarea in virgula mobila nu e asociativa (masurat: 1,46e-15 diferenţa relativa
+ * la permutare). Se obţine asa:
+ *   simulatePaths()  produce traiectoriile BRUTE pentru un interval de indici;
+ *   combineRaw()     le concateneaza IN ORDINEA INDICILOR si apeleaza summarise() O SINGURA DATA.
+ * `runCombination` fara `raw` e exact `combineRaw([simulatePaths(...)])`, deci exista O SINGURA
+ * cale de agregare in tot motorul. Cazul cu un lucrator si cazul cu N lucratori nu sunt doua
+ * implementari care se intampla sa coincida: e aceeasi implementare.
+ *
+ * Traiectoria k depinde numai de (seed, k) — xoshiro128ss(seed, k) — deci `path_offset` alege CARE
+ * traiectorii se calculeaza, fara sa schimbe niciuna.
+ */
+
+function _fixedSequence(returns) {
+  /* Modelul unui replay: secvenţa zilnica e DATA. sd declarat e cel al episodului, fiindca puntea
+     intrazi il foloseste pentru extremele din interiorul zilei. */
+  const seq = Float64Array.from(returns);
+  for (let i = 0; i < seq.length; i++) {
+    if (!Number.isFinite(seq[i])) throw new Error('path.returns[' + i + '] is not finite');
+  }
+  if (seq.length === 0) throw new Error('path.returns is empty');
+  return {
+    sd: empiricalSd(seq),
+    gen: function (rng, out, days) { for (let k = 0; k < days; k++) out[k] = seq[k]; }
+  };
+}
+
+function simulatePaths(opts) {
   const coin = opts.coin;
-  const paths = Math.max(1, Math.min(MAX_PATHS, opts.paths | 0));
-  const refPrice = coin.reference_price;
+  const replay = opts.path || null;
+  if (replay && (opts.model || opts.modelFn)) {
+    /* Un rezultat etichetat "model B" pe un drum impus ar fi o eticheta falsa. */
+    throw new Error('path and model are mutually exclusive');
+  }
+
+  const requested = opts.paths | 0;
+  if (requested > MAX_PATHS) {
+    throw new Error('paths ' + requested + ' exceeds MAX_PATHS ' + MAX_PATHS);
+  }
+  const paths = Math.max(1, requested);
+  const offset = Math.max(0, opts.path_offset | 0);
+
+  /* Preţul de referinţa: intr-un replay e inchiderea zilei de START a episodului, nu preţul de
+     azi. Altfel grila sta in locul greşit si rezultatul nu inseamna nimic. */
+  const refPrice = replay && replay.ref_close !== undefined && replay.ref_close !== null
+    ? replay.ref_close
+    : coin.reference_price;
+  if (!(refPrice > 0)) throw new Error('invalid reference price');
+
   const lo = refPrice * (1 + opts.lowPct / 100);
   const hi = refPrice * (1 + opts.highPct / 100);
   if (!(lo > 0 && hi > lo)) throw new Error('invalid grid range');
@@ -466,7 +637,11 @@ function runCombination(opts) {
   const invInit = (opts.capital / 2) / refPrice;
   const qty = invInit / Math.max(1, above);
 
-  const model = makeModel(opts.modelFn || opts.model, coin);
+  const model = replay ? _fixedSequence(replay.returns) : makeModel(opts.modelFn || opts.model, coin);
+  /* Orizontul unui replay e lungimea episodului. Nu se cicleaza si nu se trunchiaza: un episod de
+     22 de zile rulat pe 30 ar repeta zile reale, iar pe 15 ar tăia caderea. */
+  const days = replay ? replay.returns.length : opts.days;
+  if (!(days >= 1)) throw new Error('invalid days');
 
   const cfg = {
     levels: levels,
@@ -482,44 +657,111 @@ function runCombination(opts) {
     stepsPerDay: opts.allowCoarseStep
       ? Math.max(1, opts.stepsPerDay | 0)
       : Math.max(MIN_STEPS_PER_DAY, (opts.stepsPerDay | 0) || STEPS_PER_DAY),
-    days: opts.days,
+    days: days,
     sd: model.sd,
     model: model.gen
   };
 
-  const dailyBuf = new Float64Array(opts.days);
+  const dailyBuf = new Float64Array(days);
   const pnl = new Float64Array(paths), mdd = new Float64Array(paths),
         cyc = new Float64Array(paths), finInv = new Float64Array(paths),
         outFrac = new Float64Array(paths);
   let nOutside = 0, nMissed = 0;
 
-  for (let k = 0; k < paths; k++) {
+  for (let i = 0; i < paths; i++) {
+    const k = offset + i;
     const rng = xoshiro128ss(opts.seed >>> 0, k);
     const res = runPath(cfg, rng, dailyBuf);
-    pnl[k] = res.pnlPct; mdd[k] = res.mddPct; cyc[k] = res.cycles;
-    finInv[k] = res.finalInvPct; outFrac[k] = res.outsideFrac;
+    pnl[i] = res.pnlPct; mdd[i] = res.mddPct; cyc[i] = res.cycles;
+    finInv[i] = res.finalInvPct; outFrac[i] = res.outsideFrac;
     nOutside += res.outside;
     if (res.missedBuys) nMissed++;
-    if (opts.onProgress && (k & 255) === 255) opts.onProgress(k + 1, paths);
+    if (opts.onProgress && (i & 255) === 255) opts.onProgress(i + 1, paths);
   }
   if (opts.onProgress) opts.onProgress(paths, paths);
 
-  const pExit = nOutside / paths;
   return {
-    model: typeof opts.model === 'string' ? opts.model : 'INJECTED',
-    execution: opts.conservative ? 'CONSERVATIVE' : 'OPTIMISTIC',
+    raw: true,
+    path_offset: offset,
     paths: paths,
-    steps_per_day: cfg.stepsPerDay,
-    model_sd: model.sd,
+    paths_requested: requested,
+    pnl: pnl, mdd: mdd, cycles: cyc, final_inventory: finInv, outside_frac: outFrac,
+    n_outside: nOutside, n_missed: nMissed,
+    meta: {
+      model: replay ? 'REPLAY' : (typeof opts.model === 'string' ? opts.model : 'INJECTED'),
+      execution: opts.conservative ? 'CONSERVATIVE' : 'OPTIMISTIC',
+      steps_per_day: cfg.stepsPerDay,
+      model_sd: model.sd,
+      reference_price: refPrice,
+      days: days,
+      path_label: replay ? (replay.label || 'unnamed path') : null,
+      path_source: replay ? (replay.source || null) : null
+    }
+  };
+}
+
+function combineRaw(parts) {
+  if (!parts || parts.length === 0) throw new Error('combineRaw: no parts');
+  /* Ordinea indicilor, impusa aici: lucratorii pot raspunde in orice ordine, dar concatenarea NU
+     are voie sa depinda de cine a terminat primul. */
+  const ps = parts.slice().sort(function (a, b) { return a.path_offset - b.path_offset; });
+  const m0 = ps[0].meta;
+  let total = 0, requested = 0;
+  for (let i = 0; i < ps.length; i++) {
+    const m = ps[i].meta;
+    if (m.model !== m0.model || m.execution !== m0.execution ||
+        m.steps_per_day !== m0.steps_per_day || m.days !== m0.days ||
+        m.model_sd !== m0.model_sd || m.path_label !== m0.path_label) {
+      throw new Error('combineRaw: parts disagree on how they were produced');
+    }
+    if (ps[i].path_offset !== total) {
+      throw new Error('combineRaw: parts do not tile the index range (gap or overlap at ' +
+                      ps[i].path_offset + ', expected ' + total + ')');
+    }
+    total += ps[i].paths;
+    requested += ps[i].paths_requested;
+  }
+
+  const cat = function (key) {
+    const out = new Float64Array(total);
+    let at = 0;
+    for (let i = 0; i < ps.length; i++) { out.set(ps[i][key], at); at += ps[i][key].length; }
+    return out;
+  };
+  const pnl = cat('pnl'), mddA = cat('mdd'), cycA = cat('cycles'),
+        finA = cat('final_inventory'), outA = cat('outside_frac');
+  let nOutside = 0, nMissed = 0;
+  for (let i = 0; i < ps.length; i++) { nOutside += ps[i].n_outside; nMissed += ps[i].n_missed; }
+
+  const pExit = nOutside / total;
+  const out = {
+    model: m0.model,
+    execution: m0.execution,
+    paths: total,
+    paths_requested: requested,
+    steps_per_day: m0.steps_per_day,
+    model_sd: m0.model_sd,
+    reference_price: m0.reference_price,
+    days: m0.days,
     pnl_pct: summarise(pnl),
-    mdd_pct: summarise(mdd),
-    cycles: summarise(cyc),
-    final_inventory_pct: summarise(finInv),
+    mdd_pct: summarise(mddA),
+    cycles: summarise(cycA),
+    final_inventory_pct: summarise(finA),
     p_exit_range: pExit,
-    se_p_exit: Math.sqrt(pExit * (1 - pExit) / paths),
-    time_outside_range: mean(outFrac),
+    se_p_exit: Math.sqrt(pExit * (1 - pExit) / total),
+    time_outside_range: mean(outA),
     paths_with_missed_buys: nMissed
   };
+  if (m0.path_label !== null) {
+    out.path_label = m0.path_label;
+    out.path_source = m0.path_source;
+  }
+  return out;
+}
+
+function runCombination(opts) {
+  const part = simulatePaths(opts);
+  return opts.raw ? part : combineRaw([part]);
 }
 
 /* Verdictul, pe MEDIE si pe semnificatia ei statistica.
@@ -550,6 +792,18 @@ function runCombination(opts) {
 const ROBUST_SIGMAS = 2;
 
 function robustness(results) {
+  /* Un replay NU e o distribuţie peste viitoruri posibile: secvenţa zilnica e fixa, singura
+     aleatorietate rămasa e puntea intrazi, iar se_mean colapseaza (masurat: 0,006 fata de 0,121
+     pe acelasi BTC la 22 de zile). Pragul de 2 erori standard ar declara atunci totul
+     semnificativ si ar produce un verdict cu aparenţa de certitudine statistica pe un singur
+     drum. E aceeasi clasa de greseala ca verdictul pe mediana reparat in 0.1.1 — de aceea e
+     refuzata in cod, nu lasata pe seama apelantului. */
+  for (let i = 0; i < results.length; i++) {
+    if (results[i] && results[i].path_label !== undefined && results[i].path_label !== null) {
+      throw new Error('robustness() does not apply to replay results (path_label: ' +
+                      results[i].path_label + ')');
+    }
+  }
   const medianSigns = results.map(function (r) { return Math.sign(r.pnl_pct.p50); });
   const meanSigns = results.map(function (r) { return Math.sign(r.pnl_pct.mean); });
   const uniqMean = Array.from(new Set(meanSigns));
@@ -608,6 +862,16 @@ const ENGINE = {
   maxDrawdownFromPeak: maxDrawdownFromPeak,
   buildLevels: buildLevels,
   summarise: summarise,
+  planPaths: planPaths,
+  estimateSeconds: estimateSeconds,
+  BUDGET_TARGET_S: BUDGET_TARGET_S,
+  PATH_CHOICES: PATH_CHOICES,
+  PATHS_MIN: PATHS_MIN,
+  RUN_FREE_S: RUN_FREE_S,
+  RUN_CONFIRM_S: RUN_CONFIRM_S,
+  COARSE_HARD_CAP_S: COARSE_HARD_CAP_S,
+  simulatePaths: simulatePaths,
+  combineRaw: combineRaw,
   runCombination: runCombination,
   robustness: robustness,
   empiricalSd: empiricalSd,
