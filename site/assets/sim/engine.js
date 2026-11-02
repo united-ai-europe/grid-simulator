@@ -1,0 +1,544 @@
+/* iScanTrust — grid simulation engine. Pure JavaScript, no dependencies, no network.
+ *
+ * Runs identically in a Web Worker and in Node (for the test suite).
+ * Everything is deterministic given (seed, path index): the same seed reproduces the same run.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * Intraday price path (rewritten 2026-11-01 after external audit findings A-01 / A-02).
+ *
+ * The previous version added, at each sub-step, an independent normal with the *marginal* variance
+ * of a Brownian bridge. The marginals looked right but the increments were independent, so the path
+ * had unbounded variation: the number of level crossings — and therefore cycles and PnL — grew
+ * without limit as the sub-step shrank. Reported figures were an artefact of an arbitrary
+ * discretisation parameter.
+ *
+ * What it does now. Within each day the path is a genuine Brownian bridge between the two daily
+ * closes, sampled sequentially, and for every segment of that bridge the running MINIMUM and
+ * MAXIMUM are drawn from their exact closed-form distributions rather than inferred from the
+ * endpoints:
+ *
+ *     max of a bridge u -> v over duration tau, volatility s:
+ *         M = ( u + v + sqrt( (v-u)^2 - 2 s^2 tau ln U ) ) / 2 ,  U ~ Uniform(0,1)
+ *     min: the same with a minus sign before the square root.
+ *
+ * So a coarse step still sees the full range the price actually covered inside that step; the
+ * extremes do not have to be rediscovered by subdividing. That is what makes the result converge
+ * in step size instead of diverging. The remaining step dependence — repeated oscillations inside
+ * one segment — is measured, not assumed: tools/convergence_test.mjs reports the figures at 24h,
+ * 4h, 1h and 15min against the Monte Carlo error.
+ *
+ * Declared, and not verifiable from daily data (UNVERIFIED):
+ *   - the order in which the minimum and the maximum are reached inside a segment. The convention
+ *     is: a segment that ends higher than it started goes down to its minimum first; one that ends
+ *     lower goes up to its maximum first.
+ *   - the minimum and the maximum of a segment are drawn independently. They are in fact weakly
+ *     dependent; the approximation is good while the segment's volatility is small next to the
+ *     distance between the endpoints and is declared rather than hidden.
+ *
+ * Other declared conventions: the grid is spot, without leverage, initialised half cash and half
+ * asset at the reference price; levels are spaced geometrically; the order size is the initial
+ * inventory divided by the number of levels above the reference price. No model carries a trend.
+ */
+
+'use strict';
+
+/* ------------------------------------------------------------------ PRNG */
+
+function splitmix32(a) {
+  return function () {
+    a |= 0; a = (a + 0x9e3779b9) | 0;
+    let t = a ^ (a >>> 16);
+    t = Math.imul(t, 0x21f0aaad);
+    t = t ^ (t >>> 15);
+    t = Math.imul(t, 0x735a2d97);
+    return ((t = t ^ (t >>> 15)) >>> 0);
+  };
+}
+
+function xoshiro128ss(seed, stream) {
+  const sm = splitmix32((seed ^ Math.imul(stream + 1, 0x9e3779b9)) >>> 0);
+  let s0 = sm(), s1 = sm(), s2 = sm(), s3 = sm();
+  if ((s0 | s1 | s2 | s3) === 0) s0 = 1;
+  function rotl(x, k) { return ((x << k) | (x >>> (32 - k))) >>> 0; }
+  function next() {
+    const r = Math.imul(rotl(Math.imul(s1, 5), 7), 9) >>> 0;
+    const t = (s1 << 9) >>> 0;
+    s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t;
+    s3 = rotl(s3, 11);
+    return r;
+  }
+  const rng = {
+    u32: next,
+    f64: function () { return (next() + 0.5) * 2.3283064365386963e-10; },
+    int: function (n) { return next() % n; },
+    normal: null
+  };
+  let spare = null;
+  rng.normal = function () {
+    if (spare !== null) { const v = spare; spare = null; return v; }
+    let u, v, s;
+    do { u = rng.f64() * 2 - 1; v = rng.f64() * 2 - 1; s = u * u + v * v; } while (s >= 1 || s === 0);
+    const m = Math.sqrt(-2 * Math.log(s) / s);
+    spare = v * m;
+    return u * m;
+  };
+  rng.gamma = function (shape) {
+    if (shape < 1) return rng.gamma(shape + 1) * Math.pow(rng.f64(), 1 / shape);
+    const d = shape - 1 / 3, c = 1 / Math.sqrt(9 * d);
+    for (;;) {
+      let x, w;
+      do { x = rng.normal(); w = 1 + c * x; } while (w <= 0);
+      w = w * w * w;
+      const u = rng.f64(), x2 = x * x;
+      if (u < 1 - 0.0331 * x2 * x2) return d * w;
+      if (Math.log(u) < 0.5 * x2 + d * (1 - w + Math.log(w))) return d * w;
+    }
+  };
+  rng.studentT = function (nu) {
+    const g = rng.gamma(nu / 2) * 2;
+    return rng.normal() / Math.sqrt(g / nu);
+  };
+  return rng;
+}
+
+/* ------------------------------------------------------------------ statistics */
+
+function quantileSorted(sorted, q) {
+  const n = sorted.length;
+  if (n === 0) return NaN;
+  if (n === 1) return sorted[0];
+  const h = (n - 1) * q, lo = Math.floor(h), hi = Math.ceil(h);
+  return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+}
+
+const QS = [0.05, 0.25, 0.5, 0.75, 0.95];
+
+/* Monte Carlo error, reported next to every figure so a difference between two runs can be judged
+ * against it. The median gets a distribution-free interval from order statistics (no normality
+ * assumed); the mean gets the usual standard error. */
+function summarise(values) {
+  const n = values.length;
+  const s = Float64Array.from(values); s.sort();
+  const out = {};
+  for (const q of QS) out['p' + Math.round(q * 100)] = quantileSorted(s, q);
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += s[i];
+  const mean = sum / n;
+  let v = 0;
+  for (let i = 0; i < n; i++) { const d = s[i] - mean; v += d * d; }
+  const sd = Math.sqrt(v / Math.max(1, n - 1));
+  out.mean = mean;
+  out.sd = sd;
+  out.se_mean = sd / Math.sqrt(n);
+  /* 95% interval for the median from the binomial order statistics */
+  const half = 1.959963985 * Math.sqrt(n) / 2;
+  const lo = Math.max(0, Math.floor(n / 2 - half));
+  const hi = Math.min(n - 1, Math.ceil(n / 2 + half));
+  out.p50_lo = s[lo];
+  out.p50_hi = s[hi];
+  out.se_p50 = (s[hi] - s[lo]) / (2 * 1.959963985);
+  return out;
+}
+
+function mean(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; return a.length ? s / a.length : NaN; }
+
+/* Maximum drawdown measured from the RUNNING PEAK, not from the starting value.
+ * A path that rises 25% and then falls 18% has a drawdown of -18%, not 0. */
+function maxDrawdownFromPeak(series) {
+  let peak = -Infinity, mdd = 0;
+  for (let i = 0; i < series.length; i++) {
+    const v = series[i];
+    if (v > peak) peak = v;
+    if (peak > 0) {
+      const dd = v / peak - 1;
+      if (dd < mdd) mdd = dd;
+    }
+  }
+  return mdd;
+}
+
+/* ------------------------------------------------------------------ price models
+ *
+ * Every model returns { gen, sd }: a generator of daily log returns and the daily standard
+ * deviation that the intraday bridge must use. The bridge volatility used to be the empirical sd
+ * for all three models, which erased the models' disagreement on everything driven by intraday
+ * movement — cycles came out identical to the decimal for A, B and C (audit A-05).
+ */
+
+/* Model A — block bootstrap of the observed daily log returns.
+ *
+ * A block may start at any s in [0, n-L], so return i is drawn with multiplicity
+ * w_i = #{s : s <= i <= s+L-1}: L in the interior, fewer at the two ends. Centring on the
+ * UNWEIGHTED mean therefore left a systematic drift (audit A-04: positive on all 30 coins).
+ * The pool is centred on the weighted mean, so the generated path has exactly zero expected drift.
+ */
+function makeBootstrap(returns, segmentStarts, blockLen) {
+  const n = returns.length;
+  const breaks = new Uint8Array(n);
+  for (const b of segmentStarts) if (b > 0 && b < n) breaks[b] = 1;
+  const starts = [];
+  for (let i = 0; i + blockLen <= n; i++) {
+    let okStart = true;
+    for (let k = 1; k < blockLen; k++) if (breaks[i + k]) { okStart = false; break; }
+    if (okStart) starts.push(i);
+  }
+  if (starts.length === 0) for (let i = 0; i + blockLen <= n; i++) starts.push(i);
+  const startArr = Int32Array.from(starts);
+
+  const w = new Float64Array(n);
+  for (let k = 0; k < startArr.length; k++) {
+    for (let j = 0; j < blockLen; j++) w[startArr[k] + j] += 1;
+  }
+  let wsum = 0, wdot = 0;
+  for (let i = 0; i < n; i++) { wsum += w[i]; wdot += w[i] * returns[i]; }
+  const muW = wsum > 0 ? wdot / wsum : 0;
+
+  const centred = new Float64Array(n);
+  for (let i = 0; i < n; i++) centred[i] = returns[i] - muW;
+
+  /* daily sd of what this model actually emits, weighted the same way */
+  let v = 0;
+  for (let i = 0; i < n; i++) v += w[i] * centred[i] * centred[i];
+  const sd = Math.sqrt(wsum > 0 ? v / wsum : 0);
+
+  return {
+    sd: sd,
+    weightedMean: muW,
+    gen: function (rng, out, days) {
+      let k = 0;
+      while (k < days) {
+        const s = startArr[rng.int(startArr.length)];
+        for (let j = 0; j < blockLen && k < days; j++, k++) out[k] = centred[s + j];
+      }
+    }
+  };
+}
+
+/* Model B — gaussian with the observed standard deviation, zero mean. */
+function makeGaussian(returns) {
+  const mu = mean(returns);
+  let v = 0;
+  for (let i = 0; i < returns.length; i++) { const d = returns[i] - mu; v += d * d; }
+  const sd = Math.sqrt(v / Math.max(1, returns.length - 1));
+  return { sd: sd, gen: function (rng, out, days) { for (let k = 0; k < days; k++) out[k] = sd * rng.normal(); } };
+}
+
+/* Model C — Student-t with the degrees of freedom estimated by maximum likelihood on the same
+ * returns. Heavy tails measured, not assumed. The daily sd implied by the fit is scale*sqrt(df/(df-2)),
+ * which is what the intraday bridge uses. NOTE: this model has heavy tails but contains no crash
+ * scenario; see the note carried in the UI. */
+function makeStudentT(df, scale) {
+  const sd = df > 2 ? scale * Math.sqrt(df / (df - 2)) : scale;
+  return { sd: sd, gen: function (rng, out, days) { for (let k = 0; k < days; k++) out[k] = scale * rng.studentT(df); } };
+}
+
+/* ------------------------------------------------------------------ grid */
+
+function buildLevels(lo, hi, n) {
+  const L = new Float64Array(n);
+  if (n === 1) { L[0] = lo; return L; }
+  const r = Math.pow(hi / lo, 1 / (n - 1));
+  L[0] = lo;
+  for (let i = 1; i < n; i++) L[i] = L[i - 1] * r;
+  L[n - 1] = hi;
+  return L;
+}
+
+const SIDE_NONE = 0, SIDE_BUY = 1, SIDE_SELL = 2;
+
+/* Exact extremes of a Brownian bridge from u to v over duration tau with volatility s (log space). */
+function bridgeMax(u, v, s2tau, rng) {
+  const d = v - u;
+  return 0.5 * (u + v + Math.sqrt(d * d - 2 * s2tau * Math.log(rng.f64())));
+}
+function bridgeMin(u, v, s2tau, rng) {
+  const d = v - u;
+  return 0.5 * (u + v - Math.sqrt(d * d - 2 * s2tau * Math.log(rng.f64())));
+}
+
+/* ------------------------------------------------------------------ one path */
+
+function runPath(cfg, rng, dailyBuf) {
+  const { levels, qty, feeRate, deltaStar, conservative, refPrice, capital, stepsPerDay, days, sd } = cfg;
+  const nL = levels.length;
+  const lowB = levels[0], highB = levels[nL - 1];
+
+  let cash = capital / 2;
+  let inv = (capital / 2) / refPrice;
+  const invAtStart = inv;
+
+  const slot = new Uint8Array(nL);
+  const fromBuy = new Uint8Array(nL);
+  for (let i = 0; i < nL; i++) slot[i] = levels[i] < refPrice ? SIDE_BUY : (levels[i] > refPrice ? SIDE_SELL : SIDE_NONE);
+
+  let cycles = 0, feesPaid = 0, missedBuys = 0;
+  let outsideSamples = 0, totalSamples = 0, everOutside = 0;
+  /* Profit realised by completed cycles. The conservative haircut is applied to it continuously,
+   * so the equity series the drawdown is read from is the SAME series the final PnL comes from
+   * (audit A-06: they used to be two different trajectories). */
+  let realisedCycleProfit = 0;
+  const haircut = conservative ? (1 - cfg.cycleRatio) : 0;
+
+  cfg.model(rng, dailyBuf, days);
+
+  const eq = [];
+  function equity(p) { return cash + inv * p - haircut * realisedCycleProfit; }
+  let price = refPrice;
+  eq.push(equity(refPrice));
+
+  const dt = 1 / stepsPerDay;
+  const s2dt = sd * sd * dt;
+
+  /* ---- fills, driven only by the price the path has actually reached ----
+   *
+   * A pending order fills when the price reaches its level (optimistic) or passes it by at least
+   * delta* (conservative). The test is on the price alone: a level is NOT consumed by being
+   * crossed, and it is not forgotten once the move that crossed it has ended. That is what audit
+   * A-02 found missing — the old rule only looked at the sub-step that happened to straddle the
+   * level, so on a smooth path the conservative mode never fired and then reported better numbers
+   * than the optimistic one because it had sold nothing.
+   *
+   * Because the rule depends only on the extremes the path reached, and the extremes are drawn
+   * exactly, the outcome stops being a function of how finely the day is chopped up.
+   */
+  function fillBuys(pLow) {
+    const trigger = conservative ? pLow / (1 - deltaStar) : pLow;
+    for (let i = nL - 1; i >= 0; i--) {
+      const lv = levels[i];
+      if (lv < trigger) break;                 /* levels ascend: nothing deeper qualifies */
+      if (slot[i] !== SIDE_BUY) continue;
+      const cost = qty * lv * (1 + feeRate);
+      if (cash < cost) { missedBuys++; continue; }
+      cash -= cost; inv += qty; feesPaid += qty * lv * feeRate;
+      slot[i] = SIDE_NONE;
+      if (i + 1 < nL) { slot[i + 1] = SIDE_SELL; fromBuy[i + 1] = 1; }
+    }
+  }
+
+  function fillSells(pHigh) {
+    const trigger = conservative ? pHigh / (1 + deltaStar) : pHigh;
+    for (let i = 0; i < nL; i++) {
+      const lv = levels[i];
+      if (lv > trigger) break;
+      if (slot[i] !== SIDE_SELL) continue;
+      if (inv < qty * (1 - 1e-9)) continue;
+      const q = inv < qty ? inv : qty;
+      cash += q * lv * (1 - feeRate); inv -= q; feesPaid += q * lv * feeRate;
+      slot[i] = SIDE_NONE;
+      if (fromBuy[i]) {
+        const buyLv = levels[i - 1];
+        cycles++;
+        realisedCycleProfit += q * (lv * (1 - feeRate) - buyLv * (1 + feeRate));
+        fromBuy[i] = 0;
+      }
+      if (i - 1 >= 0) slot[i - 1] = SIDE_BUY;
+    }
+  }
+
+  for (let d = 0; d < days; d++) {
+    const r = dailyBuf[d];
+    const closeNext = price * Math.exp(r);
+    let lnPrev = Math.log(price);
+    const lnEnd = Math.log(closeNext);
+
+    for (let s = 1; s <= stepsPerDay; s++) {
+      /* sequential Brownian bridge: the next point, conditional on where we are and on the close */
+      let lnNow;
+      if (s === stepsPerDay) {
+        lnNow = lnEnd;
+      } else {
+        const remaining = 1 - (s - 1) * dt;
+        const m = lnPrev + (lnEnd - lnPrev) * (dt / remaining);
+        const varc = sd * sd * dt * (remaining - dt) / remaining;
+        lnNow = m + (varc > 0 ? Math.sqrt(varc) * rng.normal() : 0);
+      }
+
+      /* exact extremes of this segment */
+      const segHi = bridgeMax(lnPrev, lnNow, s2dt, rng);
+      const segLo = bridgeMin(lnPrev, lnNow, s2dt, rng);
+      const pA = Math.exp(lnPrev), pB = Math.exp(lnNow);
+      const pHi = Math.exp(segHi), pLo = Math.exp(segLo);
+
+      /* declared ordering: a segment that ends higher goes down first, one that ends lower goes up first */
+      /* Equity is sampled at the segment's EXTREMES as well as at its close. The drawdown is a
+       * running-extremum statistic: read only at segment ends it keeps creeping deeper as the step
+       * shrinks, because a finer grid of sample points finds more of the true low. The extremes are
+       * known exactly here, so sampling them makes the drawdown stop depending on the step too. */
+      if (pB >= pA) {
+        fillBuys(pLo); eq.push(equity(pLo));
+        fillSells(pHi); eq.push(equity(pHi));
+        fillBuys(pB);
+      } else {
+        fillSells(pHi); eq.push(equity(pHi));
+        fillBuys(pLo); eq.push(equity(pLo));
+        fillSells(pB);
+      }
+
+      /* time outside the grid, measured on the segment's range rather than on its endpoints */
+      totalSamples++;
+      if (pLo < lowB || pHi > highB) { outsideSamples++; everOutside = 1; }
+
+      lnPrev = lnNow;
+      eq.push(equity(pB));
+    }
+    price = closeNext;
+  }
+
+  const finalEq = equity(price);
+  const netPnl = finalEq - capital;
+
+  return {
+    pnlPct: 100 * netPnl / capital,
+    mddPct: 100 * maxDrawdownFromPeak(eq),
+    outside: everOutside,
+    outsideFrac: outsideSamples / totalSamples,
+    cycles: conservative ? cycles * cfg.cycleRatio : cycles,
+    finalInvPct: 100 * inv * price / capital,
+    fees: feesPaid,
+    missedBuys: missedBuys,
+    invAtStart: invAtStart
+  };
+}
+
+/* ------------------------------------------------------------------ public API */
+
+const MAX_PATHS = 10000;
+const BLOCK_DAYS = 5;
+
+/* Intraday resolution. Fixed, not adapted to the device.
+ *
+ * Audit A-03: the step used to drop from 1h to 4h when the machine looked slow, so the same
+ * configuration and the same seed produced different numbers on a desktop and on a phone. With the
+ * corrected path the result is stable in the step above this resolution (tools/convergence_test.mjs),
+ * but the only honest way to make the figure independent of the hardware is to stop letting the
+ * hardware choose it. Anything coarser is refused; the only knob left that affects precision is the
+ * number of paths, whose effect is reported as the Monte Carlo error next to every figure.
+ *
+ * 24 steps/day = 1 hour. Below 2h the figures stop moving by more than the Monte Carlo error; 1h is
+ * one notch finer than that, as margin. */
+const STEPS_PER_DAY = 24;
+const MIN_STEPS_PER_DAY = 24;
+
+function makeModel(name, coin) {
+  if (typeof name === 'object' && name && name.gen) return name;     /* injected by the tests */
+  const r = coin.log_returns;
+  if (name === 'A') return makeBootstrap(r, coin.segment_starts || [0], BLOCK_DAYS);
+  if (name === 'B') return makeGaussian(r);
+  if (name === 'C') return makeStudentT(coin.student_t.df, coin.student_t.scale);
+  throw new Error('unknown model: ' + name);
+}
+
+function empiricalSd(returns) {
+  const mu = mean(returns);
+  let v = 0;
+  for (let i = 0; i < returns.length; i++) { const d = returns[i] - mu; v += d * d; }
+  return Math.sqrt(v / Math.max(1, returns.length - 1));
+}
+
+function runCombination(opts) {
+  const coin = opts.coin;
+  const paths = Math.max(1, Math.min(MAX_PATHS, opts.paths | 0));
+  const refPrice = coin.reference_price;
+  const lo = refPrice * (1 + opts.lowPct / 100);
+  const hi = refPrice * (1 + opts.highPct / 100);
+  if (!(lo > 0 && hi > lo)) throw new Error('invalid grid range');
+  const nLevels = Math.max(2, Math.min(100, opts.levels | 0));
+  const levels = buildLevels(lo, hi, nLevels);
+
+  let above = 0;
+  for (let i = 0; i < nLevels; i++) if (levels[i] > refPrice) above++;
+  const invInit = (opts.capital / 2) / refPrice;
+  const qty = invInit / Math.max(1, above);
+
+  const model = makeModel(opts.modelFn || opts.model, coin);
+
+  const cfg = {
+    levels: levels,
+    qty: qty,
+    feeRate: opts.feeRate,
+    deltaStar: opts.deltaStarBps / 10000,
+    conservative: !!opts.conservative,
+    cycleRatio: opts.cycleRatio,
+    refPrice: refPrice,
+    capital: opts.capital,
+    /* allowCoarseStep exists only so tools/convergence_test.mjs can produce the evidence table
+       at resolutions the engine itself refuses to run. */
+    stepsPerDay: opts.allowCoarseStep
+      ? Math.max(1, opts.stepsPerDay | 0)
+      : Math.max(MIN_STEPS_PER_DAY, (opts.stepsPerDay | 0) || STEPS_PER_DAY),
+    days: opts.days,
+    sd: model.sd,
+    model: model.gen
+  };
+
+  const dailyBuf = new Float64Array(opts.days);
+  const pnl = new Float64Array(paths), mdd = new Float64Array(paths),
+        cyc = new Float64Array(paths), finInv = new Float64Array(paths),
+        outFrac = new Float64Array(paths);
+  let nOutside = 0, nMissed = 0;
+
+  for (let k = 0; k < paths; k++) {
+    const rng = xoshiro128ss(opts.seed >>> 0, k);
+    const res = runPath(cfg, rng, dailyBuf);
+    pnl[k] = res.pnlPct; mdd[k] = res.mddPct; cyc[k] = res.cycles;
+    finInv[k] = res.finalInvPct; outFrac[k] = res.outsideFrac;
+    nOutside += res.outside;
+    if (res.missedBuys) nMissed++;
+    if (opts.onProgress && (k & 255) === 255) opts.onProgress(k + 1, paths);
+  }
+  if (opts.onProgress) opts.onProgress(paths, paths);
+
+  const pExit = nOutside / paths;
+  return {
+    model: typeof opts.model === 'string' ? opts.model : 'INJECTED',
+    execution: opts.conservative ? 'CONSERVATIVE' : 'OPTIMISTIC',
+    paths: paths,
+    steps_per_day: cfg.stepsPerDay,
+    model_sd: model.sd,
+    pnl_pct: summarise(pnl),
+    mdd_pct: summarise(mdd),
+    cycles: summarise(cyc),
+    final_inventory_pct: summarise(finInv),
+    p_exit_range: pExit,
+    se_p_exit: Math.sqrt(pExit * (1 - pExit) / paths),
+    time_outside_range: mean(outFrac),
+    paths_with_missed_buys: nMissed
+  };
+}
+
+/* ROBUST if the sign of the median net PnL is the same in all six combinations. */
+function robustness(results) {
+  const signs = results.map(function (r) { return Math.sign(r.pnl_pct.p50); });
+  const uniq = Array.from(new Set(signs));
+  const p5 = results.map(function (r) { return r.pnl_pct.p5; });
+  return {
+    label: uniq.length === 1 ? 'ROBUST' : 'MODEL-DEPENDENT',
+    combinations: results.length,
+    median_signs: signs,
+    p5_min: Math.min.apply(null, p5),
+    p5_max: Math.max.apply(null, p5),
+    p5_spread: Math.max.apply(null, p5) - Math.min.apply(null, p5)
+  };
+}
+
+const ENGINE = {
+  xoshiro128ss: xoshiro128ss,
+  maxDrawdownFromPeak: maxDrawdownFromPeak,
+  buildLevels: buildLevels,
+  summarise: summarise,
+  runCombination: runCombination,
+  robustness: robustness,
+  empiricalSd: empiricalSd,
+  makeBootstrap: makeBootstrap,
+  makeGaussian: makeGaussian,
+  makeStudentT: makeStudentT,
+  bridgeMax: bridgeMax,
+  bridgeMin: bridgeMin,
+  MAX_PATHS: MAX_PATHS,
+  BLOCK_DAYS: BLOCK_DAYS,
+  STEPS_PER_DAY: STEPS_PER_DAY,
+  MIN_STEPS_PER_DAY: MIN_STEPS_PER_DAY
+};
+
+if (typeof module !== 'undefined' && module.exports) module.exports = ENGINE;
+if (typeof self !== 'undefined') self.ENGINE = ENGINE;

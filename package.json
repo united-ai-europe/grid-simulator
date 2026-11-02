@@ -1,0 +1,10 @@
+{
+  "name": "grid-simulator",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "node tools/sim_tests.mjs && node tools/convergence_test.mjs"
+  },
+  "engines": { "node": ">=18" }
+}
