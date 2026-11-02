@@ -137,6 +137,22 @@ function summarise(values) {
   out.p50_lo = s[lo];
   out.p50_hi = s[hi];
   out.se_p50 = (s[hi] - s[lo]) / (2 * 1.959963985);
+  /* Probabilitatea de pierdere si media celei mai rele cozi de 5% (CVaR, numita si Expected
+     Shortfall). Ambele se citesc din tabloul DEJA SORTAT, deci rezultatul nu depinde de ordinea in
+     care au venit traiectoriile — aceeasi proprietate pe care se bazeaza partitionarea pe mai
+     multi lucratori.
+     De ce exista: pana la 0.1.1 rezultatul raporta mediana si P5, iar verdictul se uita doar la
+     semnul medianei. Pe DOGE, 25 niveluri, +-15%, 30 zile, mediana era +4..+6% in toate cele sase
+     combinatii — dar in cele trei conservatoare MEDIA era negativa, si o treime din traiectorii
+     pierdeau bani. Mediana singura nu poate arata asta. */
+  let neg = 0;
+  for (let i = 0; i < n; i++) if (s[i] < 0) neg++; else break;   /* sortat crescator */
+  out.p_neg = n ? neg / n : NaN;
+  const k5 = Math.max(1, Math.round(0.05 * n));
+  let tail = 0;
+  for (let i = 0; i < k5; i++) tail += s[i];
+  out.cvar5 = k5 ? tail / k5 : NaN;
+  out.cvar5_n = k5;
   return out;
 }
 
@@ -506,15 +522,81 @@ function runCombination(opts) {
   };
 }
 
-/* ROBUST if the sign of the median net PnL is the same in all six combinations. */
+/* Verdictul, pe MEDIE si pe semnificatia ei statistica.
+ *
+ * DE CE S-A SCHIMBAT (0.1.1). Pana aici verdictul era "ROBUST daca semnul MEDIANEI e acelasi in
+ * toate sase combinatiile". Pe DOGE, 25 niveluri, +-15%, 30 zile, seed 475896362, cele sase
+ * mediane erau +4,18% ... +6,27% — toate pozitive, deci verdict ROBUST. Dar mediile erau
+ * +0,83 / -1,12 / +0,24 / -1,60 / +0,72 / -1,40 la erori standard de ~0,26: in toate trei
+ * combinatiile CONSERVATOARE valoarea asteptata era negativa, semnificativ (-1,60 ± 0,27 e la
+ * ~6 erori standard sub zero), iar 32-37% din traiectorii pierdeau bani. Verdictul numea ROBUSTA
+ * o strategie cu valoare asteptata negativa. O mediana pozitiva cu o medie negativa e exact ce
+ * produce o coada stanga grea, deci nu era un caz patologic rar: e tiparul normal al unei grile.
+ *
+ * DE CE 2 ERORI STANDARD. Pragul separa "semnul e masurat" de "semnul e zgomot Monte Carlo".
+ * |medie| >= 2*se_medie corespunde unui interval de incredere bilateral de ~95% care nu atinge
+ * zero (1,96 rotunjit la 2). Sub acest prag, A SPUNE ca semnul e cunoscut inseamna a raporta
+ * eroarea de eşantionare ca rezultat — iar remediul e la indemana vizitatorului: mai multe
+ * traiectorii strang se_medie ca 1/sqrt(N), deci "MIXED" din lipsa de semnificatie se poate
+ * transforma in verdict rulând mai mult. Nu se foloseste un prag mai sever (3 erori) pentru ca
+ * ar cere ~2,25 ori mai multe traiectorii pentru acelasi raspuns, fara ca riscul decis sa fie
+ * al unei publicatii stiintifice.
+ *
+ * CE NU ACOPERA PRAGUL: eroarea de MODEL. 2 erori standard spun ca semnul mediei e real IN
+ * MODEL. Niciunul dintre cele trei modele nu contine un crash, randamentele sunt zilnice cu o
+ * punte browniana intrazi, iar costul de execuţie e o presupunere calibrata. Un verdict ROBUST
+ * rămâne un rezultat despre modele, nu despre piaţa.
+ */
+const ROBUST_SIGMAS = 2;
+
 function robustness(results) {
-  const signs = results.map(function (r) { return Math.sign(r.pnl_pct.p50); });
-  const uniq = Array.from(new Set(signs));
+  const medianSigns = results.map(function (r) { return Math.sign(r.pnl_pct.p50); });
+  const meanSigns = results.map(function (r) { return Math.sign(r.pnl_pct.mean); });
+  const uniqMean = Array.from(new Set(meanSigns));
+  /* Semnificatia se cere pe FIECARE combinatie: o singura combinatie nehotarata face ca intregul
+     verdict sa nu fie hotarat, pentru ca verdictul e o afirmatie despre toate sase. */
+  const insignificant = [];
+  for (let i = 0; i < results.length; i++) {
+    const m = results[i].pnl_pct.mean, se = results[i].pnl_pct.se_mean;
+    if (!(Math.abs(m) >= ROBUST_SIGMAS * se)) insignificant.push(i);
+  }
+  const sameSign = uniqMean.length === 1 && uniqMean[0] !== 0;
+  const significant = insignificant.length === 0;
+
+  let label, reason;
+  if (sameSign && significant) {
+    label = uniqMean[0] > 0 ? 'ROBUST' : 'NEGATIVE EXPECTATION';
+    reason = uniqMean[0] > 0
+      ? 'mean net PnL is positive in all ' + results.length + ' combinations, each at least ' +
+        ROBUST_SIGMAS + ' standard errors from zero'
+      : 'mean net PnL is NEGATIVE in all ' + results.length + ' combinations, each at least ' +
+        ROBUST_SIGMAS + ' standard errors from zero';
+  } else {
+    label = 'MIXED';
+    reason = !sameSign
+      ? 'the sign of the mean net PnL is not the same in all combinations'
+      : 'the mean net PnL is within ' + ROBUST_SIGMAS + ' standard errors of zero in ' +
+        insignificant.length + ' of ' + results.length + ' combinations (more paths would narrow it)';
+  }
+
   const p5 = results.map(function (r) { return r.pnl_pct.p5; });
+  const pneg = results.map(function (r) { return r.pnl_pct.p_neg; });
+  const cv = results.map(function (r) { return r.pnl_pct.cvar5; });
   return {
-    label: uniq.length === 1 ? 'ROBUST' : 'MODEL-DEPENDENT',
+    label: label,
+    reason: reason,
+    sigmas: ROBUST_SIGMAS,
     combinations: results.length,
-    median_signs: signs,
+    mean_signs: meanSigns,
+    median_signs: medianSigns,
+    /* Pastrat explicit: cand mediana si media nu sunt de acord, asta E constatarea, si UI-ul
+       trebuie sa o poata spune in loc sa aleaga una dintre ele. */
+    median_mean_disagree: medianSigns.some(function (sg, i) { return sg !== meanSigns[i]; }),
+    insignificant_combinations: insignificant.length,
+    p_neg_min: Math.min.apply(null, pneg),
+    p_neg_max: Math.max.apply(null, pneg),
+    cvar5_min: Math.min.apply(null, cv),
+    cvar5_max: Math.max.apply(null, cv),
     p5_min: Math.min.apply(null, p5),
     p5_max: Math.max.apply(null, p5),
     p5_spread: Math.max.apply(null, p5) - Math.min.apply(null, p5)
@@ -529,6 +611,11 @@ const ENGINE = {
   runCombination: runCombination,
   robustness: robustness,
   empiricalSd: empiricalSd,
+  /* Exportat ca UI-ul sa poata arata volatilitatea pe care modelele o folosesc EFECTIV, fara
+     sa-si rescrie propria dispecerie A/B/C — doua dispecerii care pot ajunge sa nu coincida sunt
+     exact felul in care antetul a ajuns sa afiseze sigma30 langa rezultate rulate pe sigma de
+     doi ani. */
+  makeModel: makeModel,
   makeBootstrap: makeBootstrap,
   makeGaussian: makeGaussian,
   makeStudentT: makeStudentT,
@@ -536,6 +623,7 @@ const ENGINE = {
   bridgeMin: bridgeMin,
   MAX_PATHS: MAX_PATHS,
   BLOCK_DAYS: BLOCK_DAYS,
+  ROBUST_SIGMAS: ROBUST_SIGMAS,
   STEPS_PER_DAY: STEPS_PER_DAY,
   MIN_STEPS_PER_DAY: MIN_STEPS_PER_DAY
 };

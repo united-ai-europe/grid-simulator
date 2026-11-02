@@ -264,15 +264,106 @@ const BASE = {
   ok('A-06: drawdown-ul nu e niciodata pozitiv', c.mdd_pct.p95 <= 0 && o.mdd_pct.p95 <= 0);
 }
 
-/* ---------- eticheta ROBUST ---------- */
+/* ---------- P(x<0) si CVaR 5% din summarise ---------- */
 {
-  const mk = p50 => ({ pnl_pct: { p50, p5: p50 - 5 } });
-  ok('ROBUST cand toate medianele au acelasi semn',
-     E.robustness([mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)]).label === 'ROBUST');
-  ok('MODEL-DEPENDENT cand semnele difera',
-     E.robustness([mk(1), mk(2), mk(-3), mk(4), mk(5), mk(6)]).label === 'MODEL-DEPENDENT');
+  /* Valori construite ca sa aiba un raspuns exact, calculabil de mana: fara asta un test pe
+     statistici ar confirma orice implementare care "pare" sa mearga. */
+  const a = []; for (let i = 1; i <= 100; i++) a.push(i);
+  const s1 = E.summarise(a);
+  ok('CVaR 5% = media celor mai rele 5% (1..100 -> media 1..5 = 3)', s1.cvar5 === 3, String(s1.cvar5));
+  ok('CVaR 5% declara pe cate valori s-a calculat', s1.cvar5_n === 5, String(s1.cvar5_n));
+  ok('P(x<0) = 0 cand nimic nu e negativ', s1.p_neg === 0, String(s1.p_neg));
+
+  const b = []; for (let i = -50; i <= 49; i++) b.push(i);
+  const s2 = E.summarise(b);
+  ok('P(x<0) numara exact valorile negative (50 din 100)', s2.p_neg === 0.5, String(s2.p_neg));
+  ok('zero NU se numara ca pierdere', E.summarise([0, 1, 2, 3]).p_neg === 0,
+     String(E.summarise([0, 1, 2, 3]).p_neg));
+  ok('P(x<0) = 1 cand tot e negativ', E.summarise([-3, -2, -1]).p_neg === 1);
+
+  /* Invarianta la permutari: summarise sorteaza inainte de orice, deci cele doua marimi noi nu
+     introduc o dependenta de ordine. E proprietatea de care depinde partitionarea pe lucratori. */
+  const rngp = E.xoshiro128ss(31, 0);
+  const c0 = []; for (let i = 0; i < 500; i++) c0.push(rngp.normal() * 3 - 0.4);
+  const c1 = c0.slice();
+  for (let i = c1.length - 1; i > 0; i--) { const j = rngp.int(i + 1); const t = c1[i]; c1[i] = c1[j]; c1[j] = t; }
+  const q0 = E.summarise(c0), q1 = E.summarise(c1);
+  ok('P(x<0) si CVaR 5% sunt identice bit cu bit la permutarea intrarii',
+     q0.p_neg === q1.p_neg && q0.cvar5 === q1.cvar5 && q0.mean === q1.mean,
+     [q0.cvar5, q1.cvar5].join(' vs '));
+}
+
+/* ---------- verdictul: semnul MEDIEI, cu semnificatie (0.1.1) ---------- */
+{
+  /* Stub-ul duce acum si media si eroarea ei: pana la 0.1.1 verdictul se uita doar la mediana,
+     iar un stub fara medie nu putea prinde defectul pentru care s-a schimbat. */
+  const mk = (mean, se, p50) => ({ pnl_pct: { p50: p50 === undefined ? mean : p50, mean, se_mean: se, p5: mean - 25 } });
+  const six = (...xs) => xs;
+
+  ok('ROBUST: toate mediile pozitive si semnificative',
+     E.robustness(six(mk(1, 0.2), mk(2, 0.2), mk(3, 0.2), mk(4, 0.2), mk(5, 0.2), mk(6, 0.2))).label === 'ROBUST');
+  ok('NEGATIVE EXPECTATION: toate mediile negative si semnificative',
+     E.robustness(six(mk(-1, 0.2), mk(-2, 0.2), mk(-3, 0.2), mk(-4, 0.2), mk(-5, 0.2), mk(-6, 0.2))).label
+       === 'NEGATIVE EXPECTATION');
+  ok('MIXED cand semnele mediei difera',
+     E.robustness(six(mk(1, 0.2), mk(2, 0.2), mk(-3, 0.2), mk(4, 0.2), mk(5, 0.2), mk(6, 0.2))).label === 'MIXED');
+  ok('MIXED cand o singura combinatie e sub 2 erori standard',
+     E.robustness(six(mk(1, 0.2), mk(2, 0.2), mk(3, 0.2), mk(4, 0.2), mk(5, 0.2), mk(0.3, 0.2))).label === 'MIXED');
+  ok('o combinatie nehotarata e numarata si raportata',
+     E.robustness(six(mk(1, 0.2), mk(2, 0.2), mk(3, 0.2), mk(4, 0.2), mk(5, 0.2), mk(0.3, 0.2)))
+       .insignificant_combinations === 1);
+
+  /* Pragul, exact la limita. Verifica si inegalitatea (>=, nu >). */
+  const atLimit = E.robustness(six(mk(0.4, 0.2), mk(1, 0.2), mk(1, 0.2), mk(1, 0.2), mk(1, 0.2), mk(1, 0.2)));
+  ok('exact 2 erori standard trece (prag inclusiv)', atLimit.label === 'ROBUST',
+     atLimit.label + ' / ' + atLimit.reason);
+  const below = E.robustness(six(mk(0.39, 0.2), mk(1, 0.2), mk(1, 0.2), mk(1, 0.2), mk(1, 0.2), mk(1, 0.2)));
+  ok('putin sub 2 erori standard NU trece', below.label === 'MIXED', below.label);
+  ok('pragul e declarat in rezultat, nu implicit', atLimit.sigmas === E.ROBUST_SIGMAS && atLimit.sigmas === 2);
+
+  /* REGRESIE PE CAZUL REAL. Valorile sunt cele MASURATE pe DOGE, 25 niveluri, +-15%, 30 zile,
+     seed 475896362, 2.000 traiectorii per combinatie (02.11.2026). Toate sase medianele sunt
+     pozitive — verdictul de pana la 0.1.1 raporta ROBUST — dar mediile alterneaza cu presupunerea
+     de execuţie, iar cele conservatoare sunt negative si semnificative. */
+  const doge = [
+    mk(1.04, 0.249, 5.48), mk(-0.89, 0.243, 4.09),
+    mk(0.42, 0.267, 5.49), mk(-1.45, 0.261, 4.16),
+    mk(1.17, 0.289, 6.53), mk(-0.92, 0.282, 4.93)
+  ];
+  const rbD = E.robustness(doge);
+  ok('DOGE/seed 475896362: toate medianele sunt pozitive (de ce verdictul vechi spunea ROBUST)',
+     rbD.median_signs.every((x) => x > 0), rbD.median_signs.join(','));
+  ok('DOGE/seed 475896362: verdictul NU e ROBUST', rbD.label !== 'ROBUST', rbD.label);
+  ok('DOGE/seed 475896362: verdictul e MIXED', rbD.label === 'MIXED', rbD.label);
+  ok('DOGE/seed 475896362: dezacordul mediana/medie e semnalat explicit',
+     rbD.median_mean_disagree === true);
+  ok('DOGE/seed 475896362: mediile conservatoare sunt la peste 2 erori standard SUB zero',
+     [1, 3, 5].every((i) => doge[i].pnl_pct.mean <= -2 * doge[i].pnl_pct.se_mean),
+     [1, 3, 5].map((i) => (doge[i].pnl_pct.mean / doge[i].pnl_pct.se_mean).toFixed(1)).join(' '));
+
   ok('plaja P5 intre modele e raportata',
-     E.robustness([mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)]).p5_spread === 5);
+     E.robustness(six(mk(1, 0.2), mk(2, 0.2), mk(3, 0.2), mk(4, 0.2), mk(5, 0.2), mk(6, 0.2))).p5_spread === 5);
+}
+
+/* ---------- verdictul, pe o rulare REALA (nu pe stub) ---------- */
+{
+  /* Cablarea completa: summarise -> runCombination -> robustness. Un stub nu poate prinde o
+     greseala de legare, de pilda un camp care nu ajunge din summarise in rezultat. */
+  const rng = E.xoshiro128ss(909, 0); const rr = [];
+  for (let i = 0; i < 500; i++) rr.push(0.05 * rng.normal());
+  const coin = coinFrom(rr, 1000, 3.2);
+  const res = [];
+  for (const m of ['A', 'B', 'C']) for (const cons of [false, true])
+    res.push(E.runCombination({ ...BASE, coin, model: m, conservative: cons, paths: 800, days: 30 }));
+  ok('o rulare reala duce p_neg si cvar5 pana in rezultat',
+     res.every((r) => typeof r.pnl_pct.p_neg === 'number' && typeof r.pnl_pct.cvar5 === 'number'));
+  ok('CVaR 5% nu e niciodata peste P5 (e media cozii, nu cuantila)',
+     res.every((r) => r.pnl_pct.cvar5 <= r.pnl_pct.p5 + 1e-9),
+     res.map((r) => r.pnl_pct.cvar5.toFixed(1) + '<=' + r.pnl_pct.p5.toFixed(1)).join(' '));
+  const rb = E.robustness(res);
+  ok('verdictul pe o rulare reala e una dintre cele trei etichete',
+     ['ROBUST', 'NEGATIVE EXPECTATION', 'MIXED'].includes(rb.label), rb.label);
+  ok('verdictul isi declara motivul', typeof rb.reason === 'string' && rb.reason.length > 20, rb.reason);
 }
 
 /* ---------- eroarea Monte Carlo e raportata ---------- */
